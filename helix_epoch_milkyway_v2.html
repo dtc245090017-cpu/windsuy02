@@ -1,0 +1,670 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Helix Solar v2 (Epoch + Milky Way + Lots of Stars + Vertical Orbits)</title>
+  <style>
+    html,body{margin:0;height:100%;overflow:hidden;background:#000}
+    #hud{
+      position:fixed;left:12px;top:12px;color:#fff;font:14px/1.45 system-ui,Segoe UI,Arial;
+      background:rgba(0,0,0,.44);padding:10px 12px;border-radius:12px;backdrop-filter: blur(6px);
+      user-select:none;max-width:520px
+    }
+    #hud kbd{background:rgba(255,255,255,.12);padding:2px 6px;border-radius:6px}
+    #hud .small{opacity:.85;font-size:13px}
+  </style>
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <!-- Epoch library (nếu bị chặn vẫn có fallback) -->
+  <script src="https://cdn.jsdelivr.net/npm/astronomy-engine@2.1.19/astronomy.browser.min.js"></script>
+</head>
+<body>
+  <div id="hud">
+    <b>Helix Solar v2 (Epoch + Milky Way + Stars)</b><br/>
+    Kéo: xoay • Lăn: zoom • Chuột phải: pan<br/>
+    <span class="small">
+      <kbd>Space</kbd> pause • <kbd>+</kbd>/<kbd>-</kbd> nhanh/chậm thời gian •
+      <kbd>F</kbd> follow Sun • <kbd>T</kbd> trails • <kbd>B</kbd> bloom<br/>
+      <kbd>V</kbd> đổi “dọc” (nhiều kiểu) • <kbd>C</kbd> xóa trails • <kbd>R</kbd> reset camera gần Mặt Trời
+    </span>
+  </div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+    import { EffectComposer } from "three/addons/postprocessing/EffectComposer.js";
+    import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
+    import { UnrealBloomPass } from "three/addons/postprocessing/UnrealBloomPass.js";
+
+    // =========================
+    // A) CÁC NÚM CHỈNH ĐẸP/HIỆU NĂNG
+    // =========================
+    const SETTINGS = {
+      // ánh sáng tổng thể
+      exposure: 1.08,
+
+      // bloom mịn (mặt trời không chói)
+      bloomStrength: 0.42,
+      bloomRadius: 0.18,
+      bloomThreshold: 0.33,
+
+      // hệ mặt trời bay giống video
+      sunSpeed: 1.85,         // units/s
+      sunWiggle: 0.22,        // độ uốn đường bay
+      followSunDefault: true,
+
+      // Epoch time (tăng tốc thời gian)
+      daysPerSecond: 18,      // bấm +/- để thay
+
+      // tỉ lệ AU -> scene units
+      AU_TO_UNITS: 12.5,
+
+      // trails
+      showTrailsDefault: true,
+      trailPoints: 3000,
+      trailOpacity: 0.32,
+      trailUpdateEveryNFrames: 2,
+
+      // sao & “glow bodies”
+      starCountFar: 65000,
+      starCountNear: 22000,
+      glowBodyCount: 5200,
+
+      // Sky sphere
+      skyRadius: 2600
+    };
+
+    // Texture Milky Way “thật” (nếu fail sẽ fallback tự vẽ)
+    const MILKY_WAY_URL = "https://threejs.org/examples/textures/2294472375_24a3b8ef46_o.jpg";
+
+    // =========================
+    // B) Scene / Camera / Render
+    // =========================
+    const scene = new THREE.Scene();
+    // Tắt fog để tránh “màn đen” và nhìn sao rõ
+    // scene.fog = new THREE.FogExp2(0x000000, 0.004);
+
+    const camera = new THREE.PerspectiveCamera(55, innerWidth/innerHeight, 0.01, 9000);
+    camera.position.set(-40, 16, 92);
+
+    const renderer = new THREE.WebGLRenderer({ antialias:true });
+    renderer.setSize(innerWidth, innerHeight);
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = SETTINGS.exposure;
+    document.body.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.08;
+    controls.minDistance = 8;
+    controls.maxDistance = 2500;
+
+    const composer = new EffectComposer(renderer);
+    composer.addPass(new RenderPass(scene, camera));
+    const bloomPass = new UnrealBloomPass(
+      new THREE.Vector2(innerWidth, innerHeight),
+      SETTINGS.bloomStrength,
+      SETTINGS.bloomRadius,
+      SETTINGS.bloomThreshold
+    );
+    composer.addPass(bloomPass);
+
+    window.addEventListener("resize", () => {
+      camera.aspect = innerWidth/innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(innerWidth, innerHeight);
+      composer.setSize(innerWidth, innerHeight);
+      bloomPass.setSize(innerWidth, innerHeight);
+    });
+
+    // =========================
+    // C) Lights
+    // =========================
+    scene.add(new THREE.AmbientLight(0xffffff, 0.16));
+    const sunLight = new THREE.PointLight(0xfff2cc, 2.25, 0, 2);
+    scene.add(sunLight);
+    // ===== GLOW STARS (nền đen + sao phát sáng) =====
+function makeGlowStarField(count){
+  const pos = new Float32Array(count * 3);
+  const col = new Float32Array(count * 3);
+  const c = new THREE.Color();
+
+  for(let i=0;i<count;i++){
+    // phân bố trên quả cầu lớn quanh camera
+    const r = THREE.MathUtils.randFloat(250, 2400);
+    const th = Math.random() * Math.PI * 2;
+    const u  = THREE.MathUtils.randFloat(-1, 1);
+    const phi = Math.acos(u);
+
+    const x = r * Math.sin(phi) * Math.cos(th);
+    const y = r * Math.cos(phi);
+    const z = r * Math.sin(phi) * Math.sin(th);
+
+    pos[i*3+0]=x; pos[i*3+1]=y; pos[i*3+2]=z;
+
+    // sao hơi ngả xanh/vàng cho “thật”
+    const hue = THREE.MathUtils.randFloat(0.55, 0.12); // wrap
+    c.setHSL((hue+1)%1, THREE.MathUtils.randFloat(0.0,0.22), THREE.MathUtils.randFloat(0.75,1.0));
+    col[i*3+0]=c.r; col[i*3+1]=c.g; col[i*3+2]=c.b;
+  }
+
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+  g.setAttribute("color", new THREE.BufferAttribute(col, 3));
+
+  // PointsMaterial + Additive => “phát sáng”
+  const m = new THREE.PointsMaterial({
+    vertexColors: true,
+    size: 1.35,
+    sizeAttenuation: true,
+    transparent: true,
+    opacity: 0.9,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false
+  });
+
+  const pts = new THREE.Points(g, m);
+  scene.add(pts);
+  return pts;
+}
+
+// 2 lớp sao: xa + gần
+makeGlowStarField(90000);
+makeGlowStarField(35000);
+
+
+    // =========================
+    // D) Texture loader + fallback
+    // =========================
+    const loader = new THREE.TextureLoader();
+
+    function safeTexture(url, onOk){
+      // Không throw; nếu lỗi thì onOk(null)
+      loader.load(
+        url,
+        (t) => { t.colorSpace = THREE.SRGBColorSpace; onOk(t); },
+        undefined,
+        () => onOk(null)
+      );
+    }
+
+    function makeMilkyWayCanvasTexture(){
+      const w = 2048, h = 1024;
+      const c = document.createElement("canvas");
+      c.width = w; c.height = h;
+      const ctx = c.getContext("2d");
+
+      ctx.fillStyle = "#000000";
+      ctx.fillRect(0,0,w,h);
+
+      // stars
+      for(let i=0;i<18000;i++){
+        const x = Math.random()*w;
+        const y = Math.random()*h;
+        const a = Math.random();
+        const r = (a<0.985) ? 1 : (a<0.997 ? 2 : 3);
+        const alpha = (a<0.985) ? 0.10 : (a<0.997 ? 0.22 : 0.36);
+        ctx.fillStyle = `rgba(255,255,255,${alpha})`;
+        ctx.fillRect(x,y,r,r);
+      }
+
+      // milky band
+      const g = ctx.createLinearGradient(0, h*0.32, 0, h*0.68);
+      g.addColorStop(0.0, "rgba(255,255,255,0.00)");
+      g.addColorStop(0.25,"rgba(120,160,255,0.11)");
+      g.addColorStop(0.50,"rgba(255,255,255,0.18)");
+      g.addColorStop(0.75,"rgba(255,210,180,0.11)");
+      g.addColorStop(1.0, "rgba(255,255,255,0.00)");
+      ctx.fillStyle = g;
+      ctx.fillRect(0,0,w,h);
+
+      // dust clouds
+      for (let k=0;k<1600;k++){
+        const x = Math.random()*w;
+        const y = h*(0.32 + Math.random()*0.36);
+        const rad = 25 + Math.random()*140;
+        const alpha = 0.012 + Math.random()*0.03;
+        const cg = ctx.createRadialGradient(x,y,0,x,y,rad);
+        cg.addColorStop(0, `rgba(255,255,255,${alpha})`);
+        cg.addColorStop(1, "rgba(255,255,255,0)");
+        ctx.fillStyle = cg;
+        ctx.beginPath();
+        ctx.arc(x,y,rad,0,Math.PI*2);
+        ctx.fill();
+      }
+
+      const t = new THREE.CanvasTexture(c);
+      t.colorSpace = THREE.SRGBColorSpace;
+      t.wrapS = t.wrapT = THREE.RepeatWrapping;
+      return t;
+    }
+
+    // =========================
+    // E) Milky Way sky sphere (texture thật + fallback)
+    // =========================
+// NỀN ĐEN - không dùng ảnh
+scene.background = new THREE.Color(0x000000);
+
+    // =========================
+    // F) Stars (2 layers) + Glow bodies
+    // =========================
+    function makeStarLayer(count, radiusMin, radiusMax, size, opacity, colorJitter=0.12){
+      const pos = new Float32Array(count*3);
+      const col = new Float32Array(count*3);
+      const c = new THREE.Color();
+
+      for(let i=0;i<count;i++){
+        const r = THREE.MathUtils.randFloat(radiusMin, radiusMax);
+        const th = Math.random()*Math.PI*2;
+        const u  = THREE.MathUtils.randFloat(-1,1);
+        const phi = Math.acos(u);
+
+        pos[i*3+0] = r*Math.sin(phi)*Math.cos(th);
+        pos[i*3+1] = r*Math.cos(phi);
+        pos[i*3+2] = r*Math.sin(phi)*Math.sin(th);
+
+        // hơi ngả xanh/vàng
+        const hue = THREE.MathUtils.randFloat(0.55-colorJitter, 0.12+colorJitter);
+        const sat = THREE.MathUtils.randFloat(0.0, 0.18);
+        const lig = THREE.MathUtils.randFloat(0.72, 1.0);
+        c.setHSL((hue+1)%1, sat, lig);
+        col[i*3+0]=c.r; col[i*3+1]=c.g; col[i*3+2]=c.b;
+      }
+
+      const g = new THREE.BufferGeometry();
+      g.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+      g.setAttribute("color", new THREE.BufferAttribute(col, 3));
+
+      const m = new THREE.PointsMaterial({
+        vertexColors: true,
+        size,
+        sizeAttenuation: true,
+        transparent:true,
+        opacity,
+        depthWrite:false
+      });
+
+      const pts = new THREE.Points(g,m);
+      scene.add(pts);
+      return pts;
+    }
+
+    makeStarLayer(SETTINGS.starCountFar, 400, 2400, 1.05, 0.55);
+    makeStarLayer(SETTINGS.starCountNear, 120, 1200, 1.75, 0.35);
+
+    // Glow bodies
+    const glowGroup = new THREE.Group();
+    scene.add(glowGroup);
+
+    (function makeGlows(){
+      const count = SETTINGS.glowBodyCount;
+      const geo = new THREE.SphereGeometry(0.22, 10, 10);
+      const mat = new THREE.MeshBasicMaterial({
+        transparent:true,
+        opacity:0.82,
+        blending: THREE.AdditiveBlending,
+        depthWrite:false
+      });
+      const inst = new THREE.InstancedMesh(geo, mat, count);
+
+      const M4 = new THREE.Matrix4();
+      const P = new THREE.Vector3();
+      const Q = new THREE.Quaternion();
+      const S = new THREE.Vector3();
+      const c = new THREE.Color();
+
+      for(let i=0;i<count;i++){
+        const rr = THREE.MathUtils.randFloat(260, 2000);
+        const th = Math.random()*Math.PI*2;
+        const u = THREE.MathUtils.randFloat(-1,1);
+        const phi = Math.acos(u);
+
+        P.set(rr*Math.sin(phi)*Math.cos(th), rr*Math.cos(phi), rr*Math.sin(phi)*Math.sin(th));
+        const size = THREE.MathUtils.randFloat(0.12, 0.85);
+        S.set(size,size,size);
+        M4.compose(P,Q,S);
+        inst.setMatrixAt(i,M4);
+
+        c.setHSL(THREE.MathUtils.randFloat(0.55,0.78), THREE.MathUtils.randFloat(0.35,0.85), THREE.MathUtils.randFloat(0.60,0.92));
+        inst.setColorAt(i,c);
+      }
+      inst.instanceColor.needsUpdate = true;
+      glowGroup.add(inst);
+    })();
+
+    // =========================
+    // G) Sun (không chói) + glow sprite
+    // =========================
+    const sunMat = new THREE.MeshStandardMaterial({
+      color: 0xffd66b,
+      emissive: new THREE.Color(0xffc85c),
+      emissiveIntensity: 1.05,
+      roughness: 1.0
+    });
+
+    // thử load texture mặt trời, fail thì dùng màu
+    safeTexture("https://threejs.org/examples/textures/planets/sun.jpg", (t)=>{
+      if (t){
+        sunMat.map = t;
+        sunMat.needsUpdate = true;
+      }
+    });
+
+    const sun = new THREE.Mesh(new THREE.SphereGeometry(2.0, 64, 64), sunMat);
+    scene.add(sun);
+
+    function makeGlowSprite(){
+      const c = document.createElement("canvas");
+      c.width = 256; c.height = 256;
+      const ctx = c.getContext("2d");
+      const g = ctx.createRadialGradient(128,128,18, 128,128,120);
+      g.addColorStop(0, "rgba(255,235,175,0.28)");
+      g.addColorStop(0.40, "rgba(255,210,120,0.12)");
+      g.addColorStop(1, "rgba(255,200,80,0.0)");
+      ctx.fillStyle = g;
+      ctx.fillRect(0,0,256,256);
+      const t = new THREE.CanvasTexture(c);
+      const sp = new THREE.Sprite(new THREE.SpriteMaterial({
+        map:t, transparent:true, depthWrite:false, blending:THREE.AdditiveBlending
+      }));
+      sp.scale.set(16,16,1);
+      return sp;
+    }
+    const sunGlow = makeGlowSprite();
+    scene.add(sunGlow);
+
+    // =========================
+    // H) Vertical orbit transform (nhiều kiểu dựng “dọc”)
+    // =========================
+    // Mode 0: none (ngang)
+    // Mode 1: rotate X +90
+    // Mode 2: rotate Z +90  (thường ra “dọc” rõ)
+    // Mode 3: swap axes (dựng mạnh)
+    let verticalModeIndex = 2; // mặc định dựng dọc
+
+    const qX90 = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1,0,0), Math.PI/2);
+    const qZ90 = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0,0,1), Math.PI/2);
+
+    function orientVector(v){
+      if (verticalModeIndex === 0) return v;
+      if (verticalModeIndex === 1) return v.applyQuaternion(qX90);
+      if (verticalModeIndex === 2) return v.applyQuaternion(qZ90);
+      // swap axes: (x,y,z) -> (x,z,-y)
+      const x=v.x, y=v.y, z=v.z;
+      v.set(x, z, -y);
+      return v;
+    }
+
+    // =========================
+    // I) Trails (ring buffer)
+    // =========================
+    function makeTrail(colorHex, maxPoints){
+      const positions = new Float32Array(maxPoints*3);
+      const attr = new THREE.BufferAttribute(positions, 3);
+      attr.setUsage(THREE.DynamicDrawUsage);
+
+      const geoA = new THREE.BufferGeometry(); geoA.setAttribute("position", attr);
+      const geoB = new THREE.BufferGeometry(); geoB.setAttribute("position", attr);
+
+      const mat = new THREE.LineBasicMaterial({
+        color: colorHex,
+        transparent:true,
+        opacity: SETTINGS.trailOpacity,
+        blending: THREE.AdditiveBlending,
+        depthWrite:false
+      });
+
+      const lineA = new THREE.Line(geoA, mat);
+      const lineB = new THREE.Line(geoB, mat);
+      return { positions, attr, maxPoints, ptr:0, wrapped:false, lineA, lineB };
+    }
+
+    function pushTrail(tr, p){
+      const i = tr.ptr, b = i*3;
+      tr.positions[b]=p.x; tr.positions[b+1]=p.y; tr.positions[b+2]=p.z;
+      tr.ptr++;
+      if (tr.ptr >= tr.maxPoints){ tr.ptr = 0; tr.wrapped = true; }
+
+      if (!tr.wrapped){
+        tr.lineA.geometry.setDrawRange(0, Math.max(2, tr.ptr));
+        tr.lineB.geometry.setDrawRange(0, 0);
+      } else {
+        const oldest = tr.ptr;
+        const countA = tr.maxPoints - oldest;
+        const countB = oldest;
+        tr.lineA.geometry.setDrawRange(oldest, Math.max(2, countA));
+        tr.lineB.geometry.setDrawRange(0, Math.max(2, countB));
+      }
+      tr.attr.needsUpdate = true;
+    }
+
+    function clearTrail(tr){
+      tr.positions.fill(0);
+      tr.ptr = 0; tr.wrapped = false;
+      tr.lineA.geometry.setDrawRange(0,0);
+      tr.lineB.geometry.setDrawRange(0,0);
+      tr.attr.needsUpdate = true;
+    }
+
+    // =========================
+    // J) Planets (epoch nếu có) + fallback
+    // =========================
+    const AU = SETTINGS.AU_TO_UNITS;
+
+    const planetDefs = [
+      { key:"Mercury", color:0xbfbfbf, r:0.35, tex:"https://threejs.org/examples/textures/planets/mercury.jpg" },
+      { key:"Venus",   color:0xffd1a1, r:0.55, tex:"https://threejs.org/examples/textures/planets/venus.jpg" },
+      { key:"Earth",   color:0x66aaff, r:0.60, tex:"https://threejs.org/examples/textures/planets/earth_atmos_2048.jpg" },
+      { key:"Mars",    color:0xff7a55, r:0.45, tex:"https://threejs.org/examples/textures/planets/mars_1k_color.jpg" },
+      { key:"Jupiter", color:0xffc48a, r:1.25, tex:"https://threejs.org/examples/textures/planets/jupiter.jpg" },
+      { key:"Saturn",  color:0xffe1a8, r:1.12, tex:"https://threejs.org/examples/textures/planets/saturn.jpg", ring:true },
+      { key:"Uranus",  color:0x9fe7ff, r:0.92, tex:"https://threejs.org/examples/textures/planets/uranus.jpg" },
+      { key:"Neptune", color:0x5a88ff, r:0.92, tex:"https://threejs.org/examples/textures/planets/neptune.jpg" }
+    ];
+
+    function makePlanetMaterial(baseColor, url){
+      const mat = new THREE.MeshStandardMaterial({
+        color: baseColor,
+        roughness: 1.0,
+        metalness: 0.0,
+        emissive: new THREE.Color(0x111111),
+        emissiveIntensity: 0.22
+      });
+      safeTexture(url, (t)=>{
+        if (t){
+          mat.map = t;
+          mat.needsUpdate = true;
+        }
+      });
+      return mat;
+    }
+
+    const planets = [];
+    for(const d of planetDefs){
+      const mesh = new THREE.Mesh(
+        new THREE.SphereGeometry(d.r, 48, 48),
+        makePlanetMaterial(new THREE.Color(d.color), d.tex)
+      );
+
+      if (d.ring){
+        const ringGeo = new THREE.RingGeometry(d.r*1.25, d.r*2.05, 160);
+        const ringMat = new THREE.MeshStandardMaterial({
+          color: 0xffffff,
+          transparent:true,
+          opacity: 0.40,
+          side: THREE.DoubleSide,
+          roughness: 1.0
+        });
+        safeTexture("https://threejs.org/examples/textures/planets/saturnringcolor.jpg", (t)=>{
+          if (t){
+            ringMat.map = t;
+            ringMat.opacity = 0.90;
+            ringMat.needsUpdate = true;
+          }
+        });
+        const ring = new THREE.Mesh(ringGeo, ringMat);
+        ring.rotation.x = Math.PI/2;
+        mesh.add(ring);
+      }
+
+      const trail = makeTrail(d.color, SETTINGS.trailPoints);
+      scene.add(trail.lineA, trail.lineB);
+
+      scene.add(mesh);
+      planets.push({ ...d, mesh, trail });
+    }
+
+    // Epoch helpers (nếu Astronomy bị chặn thì fallback)
+    const HAS_ASTRONOMY = typeof window.Astronomy !== "undefined";
+
+    function helioAU_Fallback(def, tDays){
+      // quỹ đạo tròn đơn giản để vẫn thấy helix nếu epoch fail
+      // đặt bán kính AU gần đúng
+      const auRadius = {
+        Mercury: 0.39, Venus: 0.72, Earth: 1.00, Mars: 1.52,
+        Jupiter: 5.20, Saturn: 9.58, Uranus: 19.2, Neptune: 30.05
+      }[def.key] ?? 1.0;
+
+      const period = {
+        Mercury: 88, Venus: 225, Earth: 365.25, Mars: 687,
+        Jupiter: 4333, Saturn: 10759, Uranus: 30687, Neptune: 60190
+      }[def.key] ?? 365.25;
+
+      const w = 2*Math.PI/period;
+      const ang = w*tDays + (def.key.length * 0.7);
+      const x = Math.cos(ang) * auRadius;
+      const z = Math.sin(ang) * auRadius;
+      const y = 0;
+      return new THREE.Vector3(x,y,z);
+    }
+
+    function helioAU_Epoch(bodyName, date){
+      const t = Astronomy.MakeTime(date);
+      const body = Astronomy.Body[bodyName];
+      const v = Astronomy.HelioVector(body, t); // AU
+      return new THREE.Vector3(v.x, v.y, v.z);
+    }
+
+    // =========================
+    // K) Sun bay + time control + key bindings
+    // =========================
+    let paused = false;
+    let bloomOn = true;
+    let showTrails = SETTINGS.showTrailsDefault;
+    let followSun = SETTINGS.followSunDefault;
+    let daysPerSecond = SETTINGS.daysPerSecond;
+
+    // epoch start now
+    const epochDate = new Date();
+    let simDays = 0;
+
+    const sunPos = new THREE.Vector3(0,0,0);
+    controls.target.copy(sunPos);
+
+    function resetCameraNearSun(){
+      camera.position.copy(sunPos).add(new THREE.Vector3(-40, 16, 92));
+      controls.target.copy(sunPos);
+      controls.update();
+    }
+
+    window.addEventListener("keydown", (e)=>{
+      if (e.code === "Space") paused = !paused;
+      if (e.key === "+" || e.key === "=") daysPerSecond *= 1.25;
+      if (e.key === "-" || e.key === "_") daysPerSecond /= 1.25;
+      if (e.key.toLowerCase() === "b") bloomOn = !bloomOn;
+      if (e.key.toLowerCase() === "t") showTrails = !showTrails;
+      if (e.key.toLowerCase() === "f") followSun = !followSun;
+      if (e.key.toLowerCase() === "c") for(const p of planets) clearTrail(p.trail);
+      if (e.key.toLowerCase() === "r") resetCameraNearSun();
+      if (e.key.toLowerCase() === "v") {
+        verticalModeIndex = (verticalModeIndex + 1) % 4; // đổi kiểu dọc
+      }
+    });
+
+    const clock = new THREE.Clock();
+    let frame = 0;
+
+    // =========================
+    // L) Animate
+    // =========================
+    function animate(){
+      requestAnimationFrame(animate);
+
+      const dt = paused ? 0 : clock.getDelta();
+      if (!paused) simDays += dt * daysPerSecond;
+
+      // Sun bay + uốn nhẹ (giống clip)
+      const dv = new THREE.Vector3(
+        SETTINGS.sunSpeed * dt,
+        Math.sin(sunPos.x * 0.04) * SETTINGS.sunWiggle * dt,
+        Math.cos(sunPos.x * 0.03) * SETTINGS.sunWiggle * dt
+      );
+      sunPos.add(dv);
+
+      sun.position.copy(sunPos);
+      sunGlow.position.copy(sunPos);
+      sunLight.position.copy(sunPos);
+
+      // camera follow Sun để “cảm giác bay”
+      if (followSun){
+        camera.position.add(dv);
+        controls.target.add(dv);
+      } else {
+        controls.target.lerp(sunPos, 0.06);
+      }
+
+      // time
+      const curDate = new Date(epochDate.getTime() + simDays * 86400 * 1000);
+
+      // update trails nhẹ
+      frame++;
+      const updTrail = showTrails && (frame % SETTINGS.trailUpdateEveryNFrames === 0);
+
+      // planets positions (epoch or fallback)
+      for(const p of planets){
+        let auVec;
+        if (HAS_ASTRONOMY){
+          auVec = helioAU_Epoch(p.key, curDate);
+        } else {
+          auVec = helioAU_Fallback(p, simDays);
+        }
+
+        orientVector(auVec);         // dựng dọc
+        auVec.multiplyScalar(AU);    // scale
+        const worldPos = auVec.add(sunPos); // helix = SunPos + helioPos
+
+        p.mesh.position.copy(worldPos);
+        p.mesh.rotation.y += dt * 0.35;
+
+        p.trail.lineA.visible = p.trail.lineB.visible = showTrails;
+        if (updTrail) pushTrail(p.trail, worldPos);
+      }
+
+      // xoay sky nhẹ cho sống động
+      sky.rotation.y += dt * 0.0015;
+
+      controls.update();
+      if (bloomOn) composer.render();
+      else renderer.render(scene, camera);
+    }
+
+    // cảnh báo nhỏ nếu epoch lib bị chặn
+    if (!HAS_ASTRONOMY){
+      console.warn("Astronomy Engine không tải được -> đang dùng fallback quỹ đạo tròn.");
+    }
+
+    animate();
+  </script>
+</body>
+</html>
